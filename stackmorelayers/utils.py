@@ -1,13 +1,15 @@
 from functools import partial
 from io import BytesIO
+from pickle import dumps
 from re import search, compile as re_compile, Pattern
 from tarfile import TarInfo
 from time import time
-from typing import Tuple, Dict, Any, Iterable, TypeVar, Union, Iterator
+from typing import Tuple, Iterable, TypeVar, Union, Iterator, Any, Literal
 
 __all__ = (
+    'filter_search',
     'string_to_tarfile',
-    'empty_kwarg_factory'
+    'object_to_tarfile'
 )
 
 _T = TypeVar('_T')
@@ -37,19 +39,18 @@ def string_to_tarfile(filename: str, string: str) -> Tuple[BytesIO, TarInfo]:
         (BytesIO handle, TarInfo)
     """
     encoded = string.encode()
-    s = BytesIO(encoded)
-
     tar_info = TarInfo(filename)
     tar_info.mtime = int(time())
     tar_info.size = len(encoded)
-    return s, tar_info
+    return BytesIO(encoded), tar_info
 
 
-def empty_kwarg_factory() -> Dict[str, Any]:
-    """
-    Empty keyword arguments factory.
-
-    Returns:
-        Empty dict
-    """
-    return {}
+def object_to_tarfile(filename: str,
+                      obj: Any,
+                      *,
+                      protocol: Literal[0, 1, 2, 3, 4, 5]) -> Tuple[BytesIO, TarInfo]:
+    encoded = dumps(obj, protocol=protocol)
+    tar_info = TarInfo(filename)
+    tar_info.mtime = int(time())
+    tar_info.size = len(encoded)
+    return BytesIO(encoded), tar_info

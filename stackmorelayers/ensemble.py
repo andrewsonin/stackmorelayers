@@ -1,11 +1,13 @@
-from io import TextIOWrapper, BytesIO
+from io import TextIOWrapper
+from itertools import repeat
 from operator import attrgetter
 from os import makedirs, remove
 from os.path import join as join_path
 from pathlib import Path
+from pickle import load
 from tarfile import open as tar_open
 from tempfile import TemporaryDirectory
-from typing import Optional, Dict, Any, Callable, Literal, Union, List, Tuple, Iterable, overload, Sequence
+from typing import Optional, Dict, Any, Callable, Literal, Union, List, Tuple, Iterable, overload, Sequence, Iterator
 
 import numpy as np
 import pandas as pd
@@ -14,21 +16,27 @@ from scipy.stats import gmean
 from sklearn.model_selection import BaseCrossValidator, BaseShuffleSplit
 from tqdm import tqdm
 
-from stackmorelayers.typing import KWARGS_OR_FACTORY, SPLITTER, DATASET, PATH, SPLIT_ITERABLE
-from stackmorelayers.utils import string_to_tarfile, empty_kwarg_factory
+from stackmorelayers.typing import KWARGS_OR_ITERABLE, SPLITTER, DATASET, PATH, SPLIT_ITERABLE, KWARGS, COLUMN
+from stackmorelayers.utils import string_to_tarfile, object_to_tarfile
 
 __all__ = (
     "CatBoostEnsemble",
 )
 
+PICKLE_PROTOCOL: Literal[5] = 5
+
 CB_BLENDING_DUMP_BASENAME = "catboost_blending_coefficients.txt"
+CB_MODEL_KWARGS_DUMP_BASENAME = "catboost_model_kwargs.pkl"
+CB_MODEL_VAL_SCORES_DUMP_BASENAME = "catboost_validation_scores.pkl"
+CB_POOL_KWARGS_DUMP_BASENAME = "catboost_pool_constructor_kwargs.pkl"
+CB_FIT_KWARGS_DUMP_BASENAME = "catboost_fit_kwargs.pkl"
 
 
 class CatBoostEnsemble:
     """Ensemble of the CatBoost models"""
     __slots__ = (
         'model_factory',
-        'get_model_kwargs',
+        'model_kwargs',
         'n_models',
         'models',
         'blending_coefficients',
@@ -36,6 +44,8 @@ class CatBoostEnsemble:
         'elapsed_iters',
         'validation_scores',
         'rng',
+        'pool_constructor_kwargs',
+        'fit_kwargs',
         'is_fit'
     )
 
@@ -45,7 +55,7 @@ class CatBoostEnsemble:
             *,
             cat_features: Optional[Union[Iterable[int], Iterable[str]]] = None,
             n_models: int = 5,
-            model_kwargs: KWARGS_OR_FACTORY = empty_kwarg_factory,
+            model_kwargs: KWARGS_OR_ITERABLE = (),
             seed: Optional[int] = None
     ) -> None:
         """
@@ -64,9 +74,16 @@ class CatBoostEnsemble:
         self.model_factory = model_factory
 
         if isinstance(model_kwargs, dict):
-            self.get_model_kwargs = lambda: model_kwargs
-        elif hasattr(model_kwargs, '__call__'):
-            self.get_model_kwargs = model_kwargs
+            self.model_kwargs: Tuple[KWARGS, ...] = tuple(repeat(model_kwargs, n_models))
+        elif hasattr(model_kwargs, '__iter__'):
+            self.model_kwargs = tuple(model_kwargs)
+            if len(self.model_kwargs) == 0:
+                self.model_kwargs = tuple(repeat({}, n_models))
+            elif n_models != len(self.model_kwargs):
+                raise IndexError(
+                    f"Parameter model_kwargs, if iterable, should contain {n_models=} elements, "
+                    f"not {len(self.model_kwargs)}"
+                )
         else:
             raise TypeError("Parameter model_kwargs must be a dictionary or Callable that returns a dictionary")
 
@@ -87,14 +104,19 @@ class CatBoostEnsemble:
         self.elapsed_iters = 0
         self.rng = np.random.default_rng(seed)
         self.validation_scores: List[Dict[str, Any]] = []
+
+        self.pool_constructor_kwargs: Dict[str, Any] = {}
+        self.fit_kwargs: Tuple[Dict[str, Any], ...] = ()
         self.is_fit = False
 
     def _reset(self) -> None:
         self.is_fit = False
+        self.elapsed_iters = 0
         self.models = []
         self.blending_coefficients = []
-        self.elapsed_iters = 0
         self.validation_scores = []
+        self.pool_constructor_kwargs = {}
+        self.fit_kwargs = ()
 
     @overload
     def fit(self,
@@ -103,8 +125,9 @@ class CatBoostEnsemble:
             *,
             splitter: SPLIT_ITERABLE,
             groups: None,
-            fit_kwargs: KWARGS_OR_FACTORY,
-            pool_constructor_kwargs: KWARGS_OR_FACTORY) -> 'CatBoostEnsemble':
+            fit_kwargs: KWARGS_OR_ITERABLE,
+            pool_constructor_kwargs: Optional[KWARGS],
+            progress_bar: Callable[[Sequence], Iterator]) -> 'CatBoostEnsemble':
         pass
 
     @overload
@@ -112,10 +135,11 @@ class CatBoostEnsemble:
             train_dataset: DATASET,
             eval_dataset: None,
             *,
-            splitter: BaseCrossValidator,
-            groups: Optional[Union[pd.Series, np.ndarray]],
-            fit_kwargs: KWARGS_OR_FACTORY,
-            pool_constructor_kwargs: KWARGS_OR_FACTORY) -> 'CatBoostEnsemble':
+            splitter: Union[BaseShuffleSplit, BaseCrossValidator],
+            groups: Optional[COLUMN],
+            fit_kwargs: KWARGS_OR_ITERABLE,
+            pool_constructor_kwargs: Optional[KWARGS],
+            progress_bar: Callable[[Sequence], Iterator]) -> 'CatBoostEnsemble':
         pass
 
     @overload
@@ -125,8 +149,9 @@ class CatBoostEnsemble:
             *,
             splitter: None,
             groups: None,
-            fit_kwargs: KWARGS_OR_FACTORY,
-            pool_constructor_kwargs: KWARGS_OR_FACTORY) -> 'CatBoostEnsemble':
+            fit_kwargs: KWARGS_OR_ITERABLE,
+            pool_constructor_kwargs: Optional[KWARGS],
+            progress_bar: Callable[[Sequence], Iterator]) -> 'CatBoostEnsemble':
         pass
 
     def fit(self,
@@ -134,9 +159,10 @@ class CatBoostEnsemble:
             eval_dataset: Optional[DATASET] = None,
             *,
             splitter: Optional[SPLITTER] = None,
-            groups: Optional[Union[pd.Series, np.ndarray]] = None,
-            fit_kwargs: KWARGS_OR_FACTORY = empty_kwarg_factory,
-            pool_constructor_kwargs: KWARGS_OR_FACTORY = empty_kwarg_factory) -> 'CatBoostEnsemble':
+            groups: Optional[COLUMN] = None,
+            fit_kwargs: KWARGS_OR_ITERABLE = (),
+            pool_constructor_kwargs: Optional[KWARGS] = None,
+            progress_bar: Callable[[Sequence], Iterator] = tqdm) -> 'CatBoostEnsemble':
         """
         Fit models.
 
@@ -150,41 +176,43 @@ class CatBoostEnsemble:
             fit_kwargs:               keyword arguments passed to the fit method of the CatBoost models
                                       (dict | () -> dict)
             pool_constructor_kwargs:  keyword arguments passed to the catboost.Pool constructors
-                                      (dict | () -> dict)
+                                      (dict)
+            progress_bar:             progress bar class in a tqdm manner
         Returns:
             Self
         """
         self._reset()
+        if pool_constructor_kwargs is None:
+            pool_constructor_kwargs = {}
+        self.pool_constructor_kwargs = pool_constructor_kwargs
 
         if isinstance(fit_kwargs, dict):
-            def get_fit_kwargs():
-                return fit_kwargs
-        elif hasattr(fit_kwargs, '__call__'):
-            get_fit_kwargs = fit_kwargs
+            fit_kwargs = tuple(repeat(fit_kwargs, self.n_models))
+        elif hasattr(fit_kwargs, '__iter__'):
+            fit_kwargs = tuple(fit_kwargs)
+            if len(fit_kwargs) == 0:
+                fit_kwargs = tuple(repeat({}, self.n_models))
+            elif self.n_models != len(fit_kwargs):
+                n_models = self.n_models
+                raise IndexError(
+                    f"Parameter fit_kwargs, if iterable, should contain {n_models=} elements, "
+                    f"not {len(fit_kwargs)}"
+                )
         else:
             raise TypeError("Parameter fit_kwargs must be a dictionary or Callable that returns a dictionary")
-
-        if isinstance(pool_constructor_kwargs, dict):
-            def get_pool_constructor_kwargs():
-                return pool_constructor_kwargs
-        elif hasattr(pool_constructor_kwargs, '__call__'):
-            get_pool_constructor_kwargs = pool_constructor_kwargs
-        else:
-            raise TypeError(
-                "Parameter pool_constructor_kwargs must be a dictionary or Callable that returns a dictionary"
-            )
+        self.fit_kwargs = fit_kwargs
 
         if splitter is None:
             if groups is not None:
                 raise TypeError("Parameter groups cannot be set if splitter is not used")
             if not isinstance(train_dataset, Pool):
                 features, labels = train_dataset
-                train_dataset = Pool(features, labels, cat_features=self.cat_features, **get_pool_constructor_kwargs())
+                train_dataset = Pool(features, labels, cat_features=self.cat_features, **pool_constructor_kwargs)
             if not isinstance(eval_dataset, Pool):
                 if eval_dataset is None:
-                    raise TypeError("Parameter eval_dataset should not be None if splitter is None")
+                    raise TypeError("Parameter eval_dataset should not be None if splitter is not used")
                 features, labels = eval_dataset
-                eval_dataset = Pool(features, labels, cat_features=self.cat_features, **get_pool_constructor_kwargs())
+                eval_dataset = Pool(features, labels, cat_features=self.cat_features, **pool_constructor_kwargs)
 
             def get_train_eval() -> Tuple[Pool, Pool]:
                 return train_dataset, eval_dataset
@@ -207,6 +235,11 @@ class CatBoostEnsemble:
                 labels_idx_selector = labels
 
             if isinstance(splitter, (BaseShuffleSplit, BaseCrossValidator)):
+                try:
+                    if splitter.random_state is None:
+                        splitter.random_state = self.rng.integers(0, 2 ** 32)
+                except AttributeError:
+                    pass
                 n_splits = splitter.get_n_splits(features, labels, groups)
                 splitter = splitter.split(features, labels, groups)
             else:
@@ -220,7 +253,7 @@ class CatBoostEnsemble:
                 splitter = iter(splitter)
 
             if n_splits != self.n_models:
-                raise ValueError(f"The number of splits {n_splits} does not match the number of model {self.n_models}")
+                raise ValueError(f"The number of splits {n_splits} does not match the number of models {self.n_models}")
             del n_splits
 
             def get_train_eval() -> Tuple[Pool, Pool]:
@@ -229,13 +262,13 @@ class CatBoostEnsemble:
                     features_idx_selector[train_idx],
                     labels_idx_selector[train_idx],
                     cat_features=self.cat_features,
-                    **get_pool_constructor_kwargs()
+                    **pool_constructor_kwargs
                 )
                 eval_split = Pool(
                     features_idx_selector[eval_idx],
                     labels_idx_selector[eval_idx],
                     cat_features=self.cat_features,
-                    **get_pool_constructor_kwargs()
+                    **pool_constructor_kwargs
                 )
                 return train_split, eval_split
 
@@ -244,18 +277,18 @@ class CatBoostEnsemble:
         except NameError:
             pass
 
-        for _ in tqdm(range(self.elapsed_iters, self.n_models)):
+        for model_kwargs, fit_kwargs in zip(progress_bar(self.model_kwargs), fit_kwargs):
 
             model = self.model_factory(
                 cat_features=self.cat_features,
                 random_seed=self.rng.integers(0, 2 ** 63),
-                **self.get_model_kwargs()
+                **model_kwargs
             )
             train_set, eval_set = get_train_eval()
             model.fit(
                 train_set,
                 eval_set=eval_set,
-                **get_fit_kwargs()
+                **fit_kwargs
             )
             self.models.append(model)
             self.blending_coefficients.append(1.0)
@@ -285,17 +318,27 @@ class CatBoostEnsemble:
         """
         if not self.is_fit:
             raise RuntimeError("You should train your model before making any predictions")
+        if avg_method not in {'mean', 'gmean', 'concat'}:
+            raise NameError(f"Does not have such an option: {avg_method}")
+
+        iterator = zip(self.models, self.blending_coefficients)
+        if avg_method == 'mean':
+            model, coeff = next(iterator)
+            result = getattr(model, method)(dataset)
+            result *= coeff
+            for model, coeff in iterator:
+                model_pred = getattr(model, method)(dataset)
+                model_pred *= coeff
+                result += model_pred
+            result *= (1 / len(self.models))
+            return result
 
         result = np.array([
             getattr(model, method)(dataset) * coeff
-            for model, coeff in zip(self.models, self.blending_coefficients)
+            for model, coeff in iterator
         ])
-        if avg_method == 'mean':
-            result = result.mean(0)
-        elif avg_method == 'gmean':
+        if avg_method == 'gmean':
             result = gmean(result)
-        elif avg_method != 'concat':
-            raise RuntimeError(f"Does not have such an option: {avg_method}")
         return result
 
     def save_models(self, path: PATH, *, exist_ok: bool = False) -> Path:
@@ -325,6 +368,34 @@ class CatBoostEnsemble:
                 '\n'.join(map(str, self.blending_coefficients))
             )
             tar.addfile(tar_info, fileobj=fileobj)
+
+            fileobj, tar_info = object_to_tarfile(
+                CB_MODEL_KWARGS_DUMP_BASENAME,
+                self.model_kwargs,
+                protocol=PICKLE_PROTOCOL
+            )
+            tar.addfile(tar_info, fileobj=fileobj)
+
+            fileobj, tar_info = object_to_tarfile(
+                CB_MODEL_VAL_SCORES_DUMP_BASENAME,
+                self.validation_scores,
+                protocol=PICKLE_PROTOCOL
+            )
+            tar.addfile(tar_info, fileobj=fileobj)
+
+            fileobj, tar_info = object_to_tarfile(
+                CB_POOL_KWARGS_DUMP_BASENAME,
+                self.pool_constructor_kwargs,
+                protocol=PICKLE_PROTOCOL
+            )
+            tar.addfile(tar_info, fileobj=fileobj)
+
+            fileobj, tar_info = object_to_tarfile(
+                CB_FIT_KWARGS_DUMP_BASENAME,
+                self.fit_kwargs,
+                protocol=PICKLE_PROTOCOL
+            )
+            tar.addfile(tar_info, fileobj=fileobj)
         return path
 
     def load_models(self, path: PATH) -> 'CatBoostEnsemble':
@@ -337,30 +408,68 @@ class CatBoostEnsemble:
             Self
         """
         self._reset()
-        with tar_open(path, 'r:bz2') as tar, TemporaryDirectory() as tmp_path:
-            for member in sorted(tar, key=attrgetter('name')):
-                member_name = member.name
-                if member_name.endswith('.cbm'):
-                    tar.extract(member, tmp_path)
-                    model = self.model_factory(
-                        cat_features=self.cat_features,
-                        random_seed=self.rng.integers(0, 2 ** 63),
-                        **self.get_model_kwargs()
-                    )
-                    model_path = join_path(tmp_path, member_name)
-                    model.load_model(model_path)
-                    remove(model_path)
-                    self.models.append(model)
-                    self.n_models += 1
-                elif member_name == CB_BLENDING_DUMP_BASENAME:
-                    try:
-                        for i, cf in enumerate(map(str.strip, TextIOWrapper(tar.extractfile(member) or BytesIO())), 1):
-                            self.blending_coefficients.append(float(cf))
-                    except ValueError as e:
-                        raise ValueError(f"Cannot parse to float {i} line in {member_name}") from e
+        with tar_open(path, 'r:bz2') as tar:
+            files = sorted(tar, key=attrgetter('name'))
+            for member in files:
+                if member.name == CB_MODEL_KWARGS_DUMP_BASENAME:
+                    content = tar.extractfile(member)
+                    if content is None:
+                        raise RuntimeError(f"Cannot parse {CB_MODEL_KWARGS_DUMP_BASENAME} from the archive")
+                    self.model_kwargs = load(content)
+                    model_kwargs = iter(self.model_kwargs)
+                    break
+            else:
+                raise RuntimeError(f"Cannot find {CB_MODEL_KWARGS_DUMP_BASENAME} file in the archive")
+            with TemporaryDirectory() as tmp_path:
+                for member in files:
+                    member_name = member.name
+                    if member_name.endswith('.cbm'):
+                        tar.extract(member, tmp_path)
+                        try:
+                            model = self.model_factory(
+                                cat_features=self.cat_features,
+                                random_seed=self.rng.integers(0, 2 ** 63),
+                                **next(model_kwargs)
+                            )
+                        except StopIteration:
+                            raise IndexError("The number of model kwargs does not match the number of models")
+                        model_path = join_path(tmp_path, member_name)
+                        model.load_model(model_path)
+                        remove(model_path)
+                        self.models.append(model)
+                    elif member_name == CB_BLENDING_DUMP_BASENAME:
+                        content = tar.extractfile(member)
+                        if content is None:
+                            raise RuntimeError(f"Cannot parse {CB_BLENDING_DUMP_BASENAME} from the archive")
+                        try:
+                            for i, cf in enumerate(map(str.strip, TextIOWrapper(content)), 1):
+                                self.blending_coefficients.append(float(cf))
+                        except ValueError as e:
+                            raise ValueError(f"Cannot parse to float {i} line in {member_name}") from e
+                    elif member_name == CB_MODEL_VAL_SCORES_DUMP_BASENAME:
+                        content = tar.extractfile(member)
+                        if content is None:
+                            raise RuntimeError(f"Cannot parse {CB_MODEL_VAL_SCORES_DUMP_BASENAME} from the archive")
+                        self.validation_scores = load(content)
+                    elif member_name == CB_POOL_KWARGS_DUMP_BASENAME:
+                        content = tar.extractfile(member)
+                        if content is None:
+                            raise RuntimeError(f"Cannot parse {CB_POOL_KWARGS_DUMP_BASENAME} from the archive")
+                        self.pool_constructor_kwargs = load(content)
+                    elif member_name == CB_FIT_KWARGS_DUMP_BASENAME:
+                        content = tar.extractfile(member)
+                        if content is None:
+                            raise RuntimeError(f"Cannot parse {CB_FIT_KWARGS_DUMP_BASENAME} from the archive")
+                        self.fit_kwargs = load(content)
 
+        self.n_models = len(self.models)
         if self.n_models != len(self.blending_coefficients):
-            raise ValueError("The number of blending coefficients does not match the number of models")
+            raise IndexError("The number of blending coefficients does not match the number of models")
+        if self.n_models != len(self.validation_scores):
+            print(self.validation_scores)
+            raise IndexError("The number of validation scores does not match the number of models")
+        if self.n_models != len(self.fit_kwargs):
+            raise IndexError("The number of fit kwargs does not match the number of models")
 
         self.elapsed_iters = self.n_models
         self.is_fit = True
