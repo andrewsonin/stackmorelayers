@@ -49,6 +49,17 @@ def object_to_tarfile(filename: str,
                       obj: Any,
                       *,
                       protocol: Literal[0, 1, 2, 3, 4, 5]) -> Tuple[BytesIO, TarInfo]:
+    """
+    Write pickleable object to a tarfile.
+
+    Args:
+        filename:  tarfile name
+        obj:       input object
+        protocol:  pickle protocol to use
+
+    Returns:
+        (BytesIO handle, TarInfo)
+    """
     encoded = dumps(obj, protocol=protocol)
     tar_info = TarInfo(filename)
     tar_info.mtime = int(time())

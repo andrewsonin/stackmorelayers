@@ -170,11 +170,11 @@ class CatBoostEnsemble:
             train_dataset:            fitting data
             eval_dataset:             model evaluation data
             splitter:                 index splitter
-                                      (Iterable of indexer array pairs | sklearn CrossValidator | None)
+                                      (Iterable of indexer array pairs | sklearn CrossValidator / ShuffleSplit | None)
             groups:                   split groups
                                       (could only be used if split_iterator is sklearn CrossValidator or ShuffleSplit)
             fit_kwargs:               keyword arguments passed to the fit method of the CatBoost models
-                                      (dict | () -> dict)
+                                      (dict | Iterable[dict])
             pool_constructor_kwargs:  keyword arguments passed to the catboost.Pool constructors
                                       (dict)
             progress_bar:             progress bar class in a tqdm manner
@@ -325,11 +325,17 @@ class CatBoostEnsemble:
         if avg_method == 'mean':
             model, coeff = next(iterator)
             result = getattr(model, method)(dataset)
-            result *= coeff
-            for model, coeff in iterator:
-                model_pred = getattr(model, method)(dataset)
-                model_pred *= coeff
-                result += model_pred
+            if np.issubdtype(result.dtype, np.floating):
+                result *= coeff
+                for model, coeff in iterator:
+                    model_pred = getattr(model, method)(dataset)
+                    model_pred *= coeff
+                    result += model_pred
+            else:
+                result = result * coeff
+                for model, coeff in iterator:
+                    result += getattr(model, method)(dataset) * coeff
+
             result *= (1 / len(self.models))
             return result
 
@@ -416,10 +422,11 @@ class CatBoostEnsemble:
                     if content is None:
                         raise RuntimeError(f"Cannot parse {CB_MODEL_KWARGS_DUMP_BASENAME} from the archive")
                     self.model_kwargs = load(content)
-                    model_kwargs = iter(self.model_kwargs)
                     break
             else:
                 raise RuntimeError(f"Cannot find {CB_MODEL_KWARGS_DUMP_BASENAME} file in the archive")
+
+            model_kwargs = iter(self.model_kwargs)
             with TemporaryDirectory() as tmp_path:
                 for member in files:
                     member_name = member.name
@@ -466,7 +473,6 @@ class CatBoostEnsemble:
         if self.n_models != len(self.blending_coefficients):
             raise IndexError("The number of blending coefficients does not match the number of models")
         if self.n_models != len(self.validation_scores):
-            print(self.validation_scores)
             raise IndexError("The number of validation scores does not match the number of models")
         if self.n_models != len(self.fit_kwargs):
             raise IndexError("The number of fit kwargs does not match the number of models")
