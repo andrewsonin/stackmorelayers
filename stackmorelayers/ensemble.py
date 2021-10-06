@@ -16,7 +16,10 @@ from scipy.stats import gmean
 from sklearn.model_selection import BaseCrossValidator, BaseShuffleSplit
 from tqdm import tqdm
 
-from stackmorelayers.typing import KWARGS_OR_ITERABLE, SPLITTER, DATASET, PATH, SPLIT_ITERABLE, KWARGS, COLUMN
+from stackmorelayers.typing import (
+    KWARGS_OR_ITERABLE, SPLITTER, DATASET, PATH, SPLIT_ITERABLE, KWARGS, COLUMN,
+    ARRAY_INDEXER
+)
 from stackmorelayers.utils import string_to_tarfile, object_to_tarfile
 
 __all__ = (
@@ -30,6 +33,7 @@ CB_MODEL_KWARGS_DUMP_BASENAME = "catboost_model_kwargs.pkl"
 CB_MODEL_VAL_SCORES_DUMP_BASENAME = "catboost_validation_scores.pkl"
 CB_POOL_KWARGS_DUMP_BASENAME = "catboost_pool_constructor_kwargs.pkl"
 CB_FIT_KWARGS_DUMP_BASENAME = "catboost_fit_kwargs.pkl"
+CB_SPLIT_INDICES_DUMP_BASENAME = "catboost_split_indices.pkl"
 
 
 class CatBoostEnsemble:
@@ -45,6 +49,7 @@ class CatBoostEnsemble:
         'validation_scores',
         'rng',
         'pool_constructor_kwargs',
+        'split_indices',
         'fit_kwargs',
         'is_fit'
     )
@@ -107,6 +112,7 @@ class CatBoostEnsemble:
 
         self.pool_constructor_kwargs: Dict[str, Any] = {}
         self.fit_kwargs: Tuple[Dict[str, Any], ...] = ()
+        self.split_indices: Tuple[Tuple[ARRAY_INDEXER, ARRAY_INDEXER], ...] = ()
         self.is_fit = False
 
     def _reset(self) -> None:
@@ -117,6 +123,7 @@ class CatBoostEnsemble:
         self.validation_scores = []
         self.pool_constructor_kwargs = {}
         self.fit_kwargs = ()
+        self.split_indices = ()
 
     @overload
     def fit(self,
@@ -241,16 +248,18 @@ class CatBoostEnsemble:
                 except AttributeError:
                     pass
                 n_splits = splitter.get_n_splits(features, labels, groups)
-                splitter = splitter.split(features, labels, groups)
+                splitter = tuple(splitter.split(features, labels, groups))
+                self.split_indices = splitter
             else:
                 if groups is not None:
                     raise TypeError(
                         "Parameter groups cannot be set if splitter is not sklearn CrossValidator or ShuffleSplit"
                     )
-                if not isinstance(splitter, Sequence):
+                if not isinstance(splitter, tuple):
                     splitter = tuple(splitter)
+                self.split_indices = splitter
                 n_splits = len(splitter)
-                splitter = iter(splitter)
+            splitter = iter(splitter)
 
             if n_splits != self.n_models:
                 raise ValueError(f"The number of splits {n_splits} does not match the number of models {self.n_models}")
@@ -402,6 +411,13 @@ class CatBoostEnsemble:
                 protocol=PICKLE_PROTOCOL
             )
             tar.addfile(tar_info, fileobj=fileobj)
+
+            fileobj, tar_info = object_to_tarfile(
+                CB_SPLIT_INDICES_DUMP_BASENAME,
+                self.split_indices,
+                protocol=PICKLE_PROTOCOL
+            )
+            tar.addfile(tar_info, fileobj=fileobj)
         return path
 
     def load_models(self, path: PATH) -> 'CatBoostEnsemble':
@@ -468,6 +484,11 @@ class CatBoostEnsemble:
                         if content is None:
                             raise RuntimeError(f"Cannot parse {CB_FIT_KWARGS_DUMP_BASENAME} from the archive")
                         self.fit_kwargs = load(content)
+                    elif member_name == CB_SPLIT_INDICES_DUMP_BASENAME:
+                        content = tar.extractfile(member)
+                        if content is None:
+                            raise RuntimeError(f"Cannot parse {CB_SPLIT_INDICES_DUMP_BASENAME} from the archive")
+                        self.split_indices = load(content)
 
         self.n_models = len(self.models)
         if self.n_models != len(self.blending_coefficients):

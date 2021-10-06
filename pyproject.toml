@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "stackmorelayers"
-version = "0.0.3"
+version = "0.0.4"
 description = "My personal ML library"
 authors = ["Andrew Sonin <sonin.cel@yandex.ru>"]
 repository = "https://github.com/andrewsonin/stackmorelayers"
