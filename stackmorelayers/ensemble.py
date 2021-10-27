@@ -513,3 +513,32 @@ class CatBoostEnsemble:
         """
         self.rng = np.random.default_rng(seed)
         return self
+
+    def get_mean_feature_importance(self,
+                                    feature_names: Optional[Iterable[str]] = None,
+                                    *,
+                                    drop_null: bool = True,
+                                    sort: bool = True) -> pd.Series:
+        """
+        Calculate mean feature importance across all models.
+
+        Args:
+            feature_names:  feature names
+            drop_null:      whether to drop unimportant features
+            sort:           whether to sort the resulting series by the importance scores
+        Returns:
+            Series with feature importance
+        """
+        models = iter(self.models)
+        try:
+            result = pd.Series(next(models).get_feature_importance(), feature_names, dtype=float)
+        except StopIteration:
+            raise RuntimeError("You should train the ensemble before getting feature importance")
+        for model in models:
+            result += model.get_feature_importance()
+        if drop_null:
+            result = result[~np.isclose(result, 0)]
+        if sort:
+            result.sort_values(inplace=True)
+        result *= 1 / len(self.models)
+        return result
