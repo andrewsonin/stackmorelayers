@@ -24,6 +24,7 @@ from stackmorelayers.utils import string_to_tarfile, object_to_tarfile
 
 __all__ = (
     "CatBoostEnsemble",
+    "CatBoostClassifierEnsemble"
 )
 
 PICKLE_PROTOCOL: Literal[5] = 5
@@ -542,3 +543,70 @@ class CatBoostEnsemble:
             result.sort_values(inplace=True)
         result *= 1 / len(self.models)
         return result
+
+
+class CatBoostClassifierEnsemble(CatBoostEnsemble):
+    __slots__ = ()
+
+    def __init__(
+            self,
+            *,
+            cat_features: Optional[Union[Iterable[int], Iterable[str]]] = None,
+            n_models: int = 5,
+            model_kwargs: KWARGS_OR_ITERABLE = (),
+            seed: Optional[int] = None
+    ) -> None:
+        """
+        Ensemble of the CatBoost classifiers.
+
+        Args:
+            cat_features:   list of categorical features
+            n_models:       number of models to use
+            model_kwargs:   keyword arguments passed to the model constructors
+            seed:           RNG seed
+        """
+        super().__init__(cat_features=cat_features, n_models=n_models, model_kwargs=model_kwargs, seed=seed)
+
+    def predict_log_proba(self,
+                          dataset: Union[Pool, pd.DataFrame, np.ndarray],
+                          *,
+                          avg_method: Literal['mean', 'gmean', 'concat'] = 'mean') -> np.ndarray:
+        """
+        Predict log proba.
+
+        Args:
+            dataset:     input data
+            avg_method:  ensemble prediction averaging method. Possible values:
+                         ('mean' | 'gmean' | 'concat')
+        Returns:
+            Array of predictions
+        """
+        return self.apply(dataset, 'predict_log_proba', avg_method=avg_method)
+
+    def predict_proba(self,
+                      dataset: Union[Pool, pd.DataFrame, np.ndarray],
+                      *,
+                      avg_method: Literal['mean', 'gmean', 'concat'] = 'mean') -> np.ndarray:
+        """
+        Predict proba.
+
+        Args:
+            dataset:     input data
+            avg_method:  ensemble prediction averaging method. Possible values:
+                         ('mean' | 'gmean' | 'concat')
+        Returns:
+            Array of predictions
+        """
+        return self.apply(dataset, 'predict_proba', avg_method=avg_method)
+
+    def load_models(self, path: PATH) -> 'CatBoostClassifierEnsemble':
+        """
+        Load previously saved CatBoostClassifierEnsemble from disk.
+
+        Args:
+            path:  save file path
+        Returns:
+            Self
+        """
+        super().load_models(path)
+        return self

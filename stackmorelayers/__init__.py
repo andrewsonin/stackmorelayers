@@ -1,1 +1,1 @@
-from stackmorelayers.ensemble import CatBoostEnsemble
+from stackmorelayers.ensemble import CatBoostEnsemble, CatBoostClassifierEnsemble
